@@ -1,2 +1,5 @@
 nlohmann_json_v3.10.5/**
 .tags
+.cache
+wrapper
+compile_commands.json
