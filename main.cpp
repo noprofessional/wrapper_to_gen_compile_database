@@ -8,11 +8,13 @@
 
 #include <fstream>
 #include <iostream>
+#include <json.hpp>
 #include <sstream>
 
 #include "pstream.h"
 
 using namespace std;
+using nlohmann::json;
 
 int exec(const char* cmd)
 {
@@ -36,6 +38,10 @@ int main(int argc, char** argv)
     bool needDebug = (!debug || strcmp(debug, "1") != 0);
     if (needDebug)
         cout.setstate(std::ios::failbit);
+
+    char* replace = getenv("REPLACE_COMMAND");
+    bool noNeedReplace = (!replace || strcmp(replace, "1") != 0);
+    cout << "noNeedReplace:" << noNeedReplace << endl;
 
     // get cwd
     char cwd[PATH_MAX];
@@ -127,35 +133,57 @@ int main(int argc, char** argv)
 
     if (res == 0 && file.size() && reader.is_open())
     {
-        // record json
-        std::stringstream buffer;
-        buffer << reader.rdbuf();
-        string content = buffer.str();
+        // get current json
+        json root;
+        reader >> root;
         reader.close();
+
+        if (!root.is_null() && !root.is_array())
+        {
+            cerr << "root not empty and not array." << endl;
+            cout.clear();
+            return 1;
+        }
+
+        bool found = false;
+        for (auto& jsonEle : root)
+        {
+            if (!jsonEle.contains("file") || !jsonEle["file"].is_string())
+            {
+                cerr << "has invalid ele:" << jsonEle << endl;
+                cout.clear();
+                return 1;
+            }
+
+            if (jsonEle["file"].get<string>() == file)
+            {
+                found = false;
+                if (noNeedReplace)
+                {
+                    jsonEle["directory"] = cwd;
+                    jsonEle["command"] = jsoncommand;
+                }
+                else
+                {
+                    cout << "file:" << file << "already has commands." << endl;
+                    cout.clear();
+                    return 0;
+                }
+            }
+        }
+
+        if (!found)
+        {
+            json new_command_json;
+            new_command_json["file"] = file;
+            new_command_json["directory"] = cwd;
+            new_command_json["command"] = jsoncommand;
+            root.push_back(new_command_json);
+        }
 
         ofstream writer(path);
         assert(writer);
-
-        if (content.empty())
-        {
-            content += "[";
-        }
-        else
-        {
-            assert(content[content.length() - 1] == ']');
-            content.pop_back();
-            assert(content[content.length() - 1] == '}');
-            content += ",";
-        }
-
-        content += "{\"directory\":\"";
-        content += cwd;
-        content += "\",\"command\":\"";
-        content += jsoncommand;
-        content += "\",\"file\":\"";
-        content += file;
-        content += "\"}]";
-        writer << content;
+        writer << root;
         writer.flush();
         writer.close();
     }
