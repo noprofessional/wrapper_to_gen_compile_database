@@ -135,8 +135,15 @@ int main(int argc, char** argv)
     {
         // get current json
         json root;
-        reader >> root;
-        reader.close();
+        try
+        {
+            reader >> root;
+        }
+        catch (const std::exception& ex)
+        {
+            cerr << "not valid file(" << ex.what() << "). will be overwrite." << endl;
+            reader.close();
+        }
 
         if (!root.is_null() && !root.is_array())
         {
