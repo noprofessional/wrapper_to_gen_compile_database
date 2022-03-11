@@ -3,3 +3,5 @@ nlohmann_json_v3.10.5/**
 .cache
 wrapper
 compile_commands.json
+example*
+g++
