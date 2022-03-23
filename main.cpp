@@ -82,6 +82,11 @@ int main(int argc, char** argv)
     // get command
     string file;
     string allcommand = "/usr/bin/";
+    // TODO use which get path
+    if (strcmp(argv[0], "clang") == 0)
+    {
+        allcommand = "/usr/local/bin/";
+    }
     for (int i = 0; i < argc; ++i)
     {
         char* suffix_c = strstr(argv[i], ".c");
