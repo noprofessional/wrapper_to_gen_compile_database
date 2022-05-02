@@ -16,6 +16,63 @@
 using namespace std;
 using nlohmann::json;
 
+// TODO close on exec stream
+class LogStream : public std::ostringstream
+{
+    static std::string m_path;
+    static int m_fd;
+
+public:
+    LogStream() {}
+
+    ~LogStream()
+    {
+        // write to file
+        assert(m_fd);
+        const string& log = str();
+        if (log.back() != '\n')
+            (*this) << '\n';
+        ::write(m_fd, str().c_str(), str().size());
+    }
+
+    static bool init(const std::string& path)
+    {
+        m_path = path;
+        int res = open(m_path.c_str(), O_CLOEXEC | O_CREAT | O_TRUNC | O_WRONLY, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
+        if (res < 0)
+        {
+            cerr << " open with err:" << strerror(errno) << endl;
+            return false;
+        }
+
+        m_fd = res;
+        return true;
+    }
+
+    static void syncLog()
+    {
+        ::fsync(m_fd);
+        ::close(m_fd);
+        m_fd = 0;
+    }
+};
+
+int LogStream::m_fd = 0;
+string LogStream::m_path;
+
+struct RAIIForceSync
+{
+    RAIIForceSync() {}
+    ~RAIIForceSync()
+    {
+        LogStream::syncLog();
+    }
+};
+
+#define INIT_LOG(x) assert(LogStream::init(x))
+#define LOG() LogStream()
+#define ENSURE_SYNC_LOG() RAIIForceSync temp;
+
 int exec(const char* cmd)
 {
     redi::ipstream proc(cmd, redi::pstreams::pstdout | redi::pstreams::pstderr);
@@ -32,29 +89,53 @@ int exec(const char* cmd)
     return proc.close();
 }
 
-int main(int argc, char** argv)
+enum ErrCode
 {
-    char* debug = getenv("WRAPPER_DEBUG");
-    bool needDebug = (!debug || strcmp(debug, "1") != 0);
-    if (needDebug)
-        cout.setstate(std::ios::failbit);
+    E_OK = 0,
+    E_NOC1PLUS = 1,
+    E_EMPTYCOMMANS = 2,
+    E_ENOSOURCEFILE = 3,
+    E_JSON_NOT_VALID = 4,
+    E_NO_JSON_FILE = 5,
+};
 
-    char* replace = getenv("REPLACE_COMMAND");
-    bool noNeedReplace = (!replace || strcmp(replace, "1") != 0);
-    cout << "noNeedReplace:" << noNeedReplace << endl;
+vector<string> suffixes{
+    ".cpp",
+    ".cc",
+    ".c",
+};
 
+bool isSourceFile(char* arg)
+{
+    string temp(arg);
+
+    // find source file
+    for (int i = 0; i < suffixes.size(); ++i)
+    {
+        const string& suffix = suffixes[i];
+        auto suffixpos = temp.find(suffix);
+        if (suffixpos == string::npos)
+            continue;
+        else
+            return true;
+    }
+    return false;
+}
+
+int runParent(int argc, char** argv)
+{
     // get cwd
     char cwd[PATH_MAX];
     if (getcwd(cwd, sizeof(cwd)) == NULL)
         return 1;
-    cout << "pwd:" << cwd << endl;
+    LOG() << "cwd:" << cwd << endl;
 
     // get $HOME
     struct passwd* pw = getpwuid(getuid());
     const char* homedir = pw->pw_dir;
-    cout << "home:" << homedir << endl;
+    LOG() << "home:" << homedir << endl;
 
-    // recursive find compile_commands.json
+    // recursive find compile_commands.json until $HOME or root
     char dirpath[PATH_MAX];
     strcpy(dirpath, cwd);
     string path;
@@ -63,146 +144,168 @@ int main(int argc, char** argv)
     {
         path = dirpath;
         path += "/compile_commands.json";
-        cout << "try path:" << path << endl;
+        LOG() << "try path:" << path << endl;
         ifstream fs(path);
         if (fs)
         {
             swap(reader, fs);
             break;
         }
-    } while (strcmp(dirname(dirpath), homedir) != 0);
+    } while (strcmp(dirname(dirpath), homedir) != 0 && strcmp(dirpath, "/") != 0);
 
     if (!reader.is_open())
     {
-        cerr << "missing compile_commands.json" << endl;
+        LOG() << "missing compile_commands.json" << endl;
+        return E_NO_JSON_FILE;
     }
-    cout << "json path:" << path << endl;
 
-    // get filename
-    // get command
-    string file;
-    string allcommand = "/usr/bin/";
-    // TODO use which get path
-    if (strcmp(argv[0], "clang") == 0)
+    LOG() << "json path:" << path << endl;
+
+    // get current json
+    json root;
+    try
     {
-        allcommand = "/usr/local/bin/";
+        reader >> root;
     }
+    catch (const std::exception& ex)
+    {
+        LOG() << "not valid file(" << ex.what() << "). will be overwrite.";
+        reader.close();
+    }
+
+    if (!root.is_null() && !root.is_array())
+    {
+        LOG() << "root not empty and not array." << endl;
+        return E_JSON_NOT_VALID;
+    }
+
+    // multiple source use same command
+    string command;
+    vector<pair<size_t, string>> sourceFiles;
     for (int i = 0; i < argc; ++i)
     {
-        char* suffix_c = strstr(argv[i], ".c");
-        char* suffix_cc = strstr(argv[i], ".cc");
-        char* suffix_cpp = strstr(argv[i], ".cpp");
-        if ((suffix_c && suffix_c[2] == '\0') ||
-            (suffix_cc && suffix_cc[3] == '\0') ||
-            (suffix_cpp && suffix_cpp[4] == '\0'))
+        if (isSourceFile(argv[i]))
         {
-            file = argv[i];
+            sourceFiles.push_back(make_pair(command.size(), argv[i]));
+            command += string(strlen(argv[i]), ' ');
         }
-
-        allcommand += argv[i];
-        allcommand += " ";
+        else
+        {
+            command += argv[i];
+        }
+        command += " ";
     }
 
-    cout << "c/c++ source file:" << file << endl;
-
-    string jsoncommand = allcommand;
-    cout << "json command:" << jsoncommand << endl;
-
-    // check redirects
-    char outname[256];
-    ssize_t rval;
-    rval = readlink("/proc/self/fd/1", outname, sizeof(outname));
-    outname[rval] = '\0';
-    cout << "stdout:" << outname << endl;
-    if (strcmp(outname, "/dev/null") == 0)
+    size_t lastPos = 0;
+    const string* lastFile = nullptr;
+    for (int i = 0; i < sourceFiles.size(); ++i)
     {
-        allcommand += " 1>/dev/null";
-    }
-
-    char errname[256];
-    rval = readlink("/proc/self/fd/2", errname, sizeof(errname));
-    errname[rval] = '\0';
-    cout << "stderr:" << errname << endl;
-    if (strcmp(errname, "/dev/null") == 0)
-    {
-        allcommand += " 2>/dev/null";
-    }
-    cout << "all command:" << allcommand << endl;
-
-    // run ori command
-    cout.clear();
-    int res = exec(allcommand.c_str());
-    if (needDebug)
-        cout.setstate(std::ios::failbit);
-    cout << "status:" << res << endl;
-
-    if (res == 0 && file.size() && reader.is_open())
-    {
-        // get current json
-        json root;
-        try
-        {
-            reader >> root;
-        }
-        catch (const std::exception& ex)
-        {
-            cerr << "not valid file(" << ex.what() << "). will be overwrite." << endl;
-            reader.close();
-        }
-
-        if (!root.is_null() && !root.is_array())
-        {
-            cerr << "root not empty and not array." << endl;
-            cout.clear();
-            return 1;
-        }
+        size_t pos = sourceFiles[i].first;
+        const string& sourceFile = sourceFiles[i].second;
+        command.replace(pos, sourceFile.size(), sourceFile);
+        if (lastFile)
+            command.replace(lastPos, lastFile->size(), string(lastFile->size(), ' '));
+        lastPos = pos;
+        lastFile = &sourceFile;
 
         bool found = false;
         for (auto& jsonEle : root)
         {
             if (!jsonEle.contains("file") || !jsonEle["file"].is_string())
             {
-                cerr << "has invalid ele:" << jsonEle << endl;
-                cout.clear();
+                LOG() << "has invalid ele:" << jsonEle << endl;
                 return 1;
             }
 
-            if (jsonEle["file"].get<string>() == file)
+            // always replace
+            if (jsonEle["file"].get<string>() == sourceFile)
             {
-                found = false;
-                if (noNeedReplace)
-                {
-                    jsonEle["directory"] = cwd;
-                    jsonEle["command"] = jsoncommand;
-                }
-                else
-                {
-                    cout << "file:" << file << "already has commands." << endl;
-                    cout.clear();
-                    return 0;
-                }
+                found = true;
+                jsonEle["directory"] = cwd;
+                jsonEle["command"] = command;
+                break;
             }
         }
 
         if (!found)
         {
             json new_command_json;
-            new_command_json["file"] = file;
+            new_command_json["file"] = sourceFile;
             new_command_json["directory"] = cwd;
-            new_command_json["command"] = jsoncommand;
+            new_command_json["command"] = command;
             root.push_back(new_command_json);
         }
-
-        ofstream writer(path);
-        assert(writer);
-        writer << root;
-        writer.flush();
-        writer.close();
     }
-    cout.clear();
 
-    if (res != 0)
+    ofstream writer(path);
+    assert(writer);
+    writer << setw(4) << root;
+    writer.flush();
+    writer.close();
+
+    return 0;
+}
+
+int main(int argc, char** argv)
+{
+    LogStream::init("test.log");
+
+    char* oriarg0 = argv[0];
+    char exepath[PATH_MAX];
+    const char* prefix = "/usr/bin/";
+    strcpy(exepath, prefix);
+    strcpy(exepath + strlen(prefix), argv[0]);
+    argv[0] = exepath;
+    LOG() << "arg0:" << argv[0];
+
+    // fork and run original command
+    // give stdout and stderr to child process
+    int pid = fork();
+    if (pid < 0)
+    {
+        LOG() << "fork failed. with err:" << strerror(errno) << endl;
         return 1;
+    }
+    else if (pid == 0)
+    {
+        // run original command with stdout and stderr owned
+        int res = execvp(argv[0], &argv[0]);
+        // only return if error happened
+        // directly exit DO NOT RUN CODE AFTER THIS
+        exit(res);
+    }
+
+    close(STDIN_FILENO);
+    close(STDOUT_FILENO);
+    close(STDERR_FILENO);
+
+    int res = runParent(argc, argv);
+    if (res != 0)
+    {
+        LOG() << "record command failed with res:" << res;
+    }
+
+    ENSURE_SYNC_LOG();
+    // wait for child end
+    // child error return negative error
+    int status;
+    if (waitpid(pid, &status, 0) == -1)
+    {
+        // handle error
+        LOG() << "wait pid err:" << errno;
+        return -errno;
+    }
     else
-        return 0;
+    {
+        if (WIFEXITED(status))
+        {
+            LOG() << "child exit with code:" << WEXITSTATUS(status);
+            return 0;
+        }
+        else
+        {
+            LOG() << "child other status change:" << status;
+            return -1;
+        }
+    }
 }
