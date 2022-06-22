@@ -1,8 +1,11 @@
 #include <assert.h>
+#include <fcntl.h>
 #include <libgen.h>
 #include <limits.h>
 #include <pwd.h>
+#include <semaphore.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -16,11 +19,52 @@
 using namespace std;
 using nlohmann::json;
 
+struct RAIIForSemaphoreCreate
+{
+    RAIIForSemaphoreCreate(const char* name) : m_name(name)
+    {
+        m_ori = sem_open(m_name.c_str(), O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP, 1);
+    }
+
+    ~RAIIForSemaphoreCreate()
+    {
+        if (m_ori)
+            sem_unlink(m_name.c_str());
+    }
+
+    RAIIForSemaphoreCreate(RAIIForSemaphoreCreate&) = delete;
+    RAIIForSemaphoreCreate& operator=(const RAIIForSemaphoreCreate&) = delete;
+
+    string m_name;
+    sem_t* m_ori;
+};
+
+struct RAIIForSemaphoreWait
+{
+    RAIIForSemaphoreWait(RAIIForSemaphoreCreate& semCreated) : m_semCreated(semCreated)
+    {
+        assert(m_semCreated.m_ori);
+        sem_wait(m_semCreated.m_ori);
+    }
+
+    ~RAIIForSemaphoreWait()
+    {
+        assert(m_semCreated.m_ori);
+        sem_post(m_semCreated.m_ori);
+    }
+
+    RAIIForSemaphoreWait(RAIIForSemaphoreWait&) = delete;
+    RAIIForSemaphoreWait& operator=(const RAIIForSemaphoreWait&) = delete;
+
+    RAIIForSemaphoreCreate& m_semCreated;
+};
+
 // TODO close on exec stream
 class LogStream : public std::ostringstream
 {
     static std::string m_path;
     static int m_fd;
+    static RAIIForSemaphoreCreate* m_sem;
 
 public:
     LogStream() {}
@@ -32,19 +76,22 @@ public:
         const string& log = str();
         if (log.back() != '\n')
             (*this) << '\n';
+
+        RAIIForSemaphoreWait scope_lock(*m_sem);
         ::write(m_fd, str().c_str(), str().size());
     }
 
-    static bool init(const std::string& path)
+    static bool init(const std::string& path, RAIIForSemaphoreCreate* logsem)
     {
         m_path = path;
-        int res = open(m_path.c_str(), O_CLOEXEC | O_CREAT | O_TRUNC | O_WRONLY, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
+        int res = open(m_path.c_str(), O_CLOEXEC | O_CREAT | O_APPEND | O_WRONLY, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
         if (res < 0)
         {
             cerr << " open with err:" << strerror(errno) << endl;
             return false;
         }
 
+        m_sem = logsem;
         m_fd = res;
         return true;
     }
@@ -59,6 +106,7 @@ public:
 
 int LogStream::m_fd = 0;
 string LogStream::m_path;
+RAIIForSemaphoreCreate* LogStream::m_sem = nullptr;
 
 struct RAIIForceSync
 {
@@ -97,6 +145,7 @@ enum ErrCode
     E_ENOSOURCEFILE = 3,
     E_JSON_NOT_VALID = 4,
     E_NO_JSON_FILE = 5,
+    E_SEM_OPEN_FAILED = 6,
 };
 
 vector<string> suffixes{
@@ -124,6 +173,14 @@ bool isSourceFile(char* arg)
 
 int runParent(int argc, char** argv)
 {
+    // try open semaphore first
+    RAIIForSemaphoreCreate semCreated("/liuzheng_wrapper_only");
+    if (!semCreated.m_ori)
+    {
+        LOG() << " create sem failed with err:" << strerror(errno);
+        return E_SEM_OPEN_FAILED;
+    }
+
     // get cwd
     char cwd[PATH_MAX];
     if (getcwd(cwd, sizeof(cwd)) == NULL)
@@ -160,6 +217,10 @@ int runParent(int argc, char** argv)
     }
 
     LOG() << "json path:" << path << endl;
+
+    // I don't think ifstream constructor actually read the file
+    // so the lock operation can be delay to right before operator>>
+    RAIIForSemaphoreWait scope_lock(semCreated);
 
     // get current json
     json root;
@@ -248,7 +309,14 @@ int runParent(int argc, char** argv)
 
 int main(int argc, char** argv)
 {
-    LogStream::init("test.log");
+    RAIIForSemaphoreCreate logSem("/liuzheng_log_only");
+    if(!logSem.m_ori)
+    {
+        cerr << "log semaphore create failed:" << strerror(errno) << endl;
+        return 1;
+    }
+
+    LogStream::init("test.log", &logSem);
 
     char* oriarg0 = argv[0];
     char exepath[PATH_MAX];
